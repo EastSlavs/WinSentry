@@ -6,10 +6,12 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <chrono>
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_TOGGLE 1001
 #define ID_TRAY_EXIT 1002
+#define ID_TRAY_TIMER 1003
 
 // ==========================================
 // 全局状态与数据结构
@@ -27,6 +29,9 @@ uint64_t g_prevNetIn = 0, g_prevNetOut = 0;
 void* g_gpuHandle = nullptr;
 bool g_hasGPU = false;
 bool g_showOverlay = true;
+
+bool g_isTiming = false;
+std::chrono::steady_clock::time_point g_startTime;
 
 int g_alertCount = 0;
 int g_cooldown = 0;
@@ -154,6 +159,16 @@ void DrawOverlay(HDC hdc) {
     if (g_hasGPU) text << "GPU: " << g_hwData.gpuUtil << "%  TMP: " << g_hwData.gpuTemp << "C\n";
     text << "DN: " << g_hwData.dlSpeed << "\nUP: " << g_hwData.ulSpeed;
 
+    if (g_isTiming) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_startTime).count();
+        int h = elapsed / 3600;
+        int m = (elapsed % 3600) / 60;
+        int s = elapsed % 60;
+        text << "\nTIME: " << std::setfill('0') << std::setw(2) << h << ":"
+             << std::setw(2) << m << ":" << std::setw(2) << s;
+    }
+
     std::string output = text.str();
     HFONT hFont = CreateFontA(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -182,8 +197,8 @@ void ShowTrayMenu(HWND hwnd) {
     GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
 
-    // 修复：使用 AppendMenuW 宽字符版本，并加 L 前缀，解决中文乱码
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_TOGGLE, g_showOverlay ? L"隐藏悬浮窗" : L"显示悬浮窗");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_TIMER, g_isTiming ? L"停止计时" : L"开始游戏计时");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出程序");
 
@@ -203,7 +218,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (LOWORD(wParam) == ID_TRAY_TOGGLE) {
                 g_showOverlay = !g_showOverlay;
                 ShowWindow(hwnd, g_showOverlay ? SW_SHOW : SW_HIDE);
-            } else if (LOWORD(wParam) == ID_TRAY_EXIT) {
+            }
+            else if (LOWORD(wParam) == ID_TRAY_TIMER) {
+                if (!g_isTiming) {
+                    // 开始计时：记录时间，并把窗口高度动态拉伸到 115
+                    g_startTime = std::chrono::steady_clock::now();
+                    g_isTiming = true;
+                    SetWindowPos(hwnd, NULL, 0, 0, 220, 115, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                } else {
+                    // 停止计时：还原标志位，并把窗口高度缩回 90
+                    g_isTiming = false;
+                    SetWindowPos(hwnd, NULL, 0, 0, 220, 90, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_startTime).count();
+
+                    if (elapsed >= 60) {
+                        SYSTEMTIME st;
+                        GetLocalTime(&st);
+                        char timeStr[64];
+                        sprintf_s(timeStr, "%04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+                        std::ofstream file("WinSentry_GameTime.csv", std::ios::app);
+                        if (file.is_open()) {
+                            file << timeStr << ", SessionDuration(s): " << elapsed << "\n";
+                        }
+                    }
+                    InvalidateRect(hwnd, NULL, TRUE);
+                }
+            }
+            else if (LOWORD(wParam) == ID_TRAY_EXIT) {
                 PostQuitMessage(0);
             }
             return 0;
@@ -238,6 +282,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RegisterClassA(&wc);
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
+    // 初始创建时，默认高度为不计时的 90
     HWND hwnd = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         className, "WinSentry", WS_POPUP,
