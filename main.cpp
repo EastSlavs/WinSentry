@@ -1,3 +1,11 @@
+#include "resource.h"
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#undef WINVER
+#define WINVER 0x0A00
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
 #include <iomanip>
@@ -7,15 +15,14 @@
 #include <string>
 #include <fstream>
 #include <chrono>
+#include <map>
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_TOGGLE 1001
 #define ID_TRAY_EXIT 1002
 #define ID_TRAY_TIMER 1003
+#define ID_TRAY_AWAKE 1004
 
-// ==========================================
-// 全局状态与数据结构
-// ==========================================
 struct HardwareData {
     double cpuUsage = 0.0;
     DWORD memLoad = 0;
@@ -25,13 +32,23 @@ struct HardwareData {
 } g_hwData;
 
 FILETIME g_prevIdleTime, g_prevKernelTime, g_prevUserTime;
-uint64_t g_prevNetIn = 0, g_prevNetOut = 0;
+std::map<NET_IFINDEX, uint64_t> g_prevNetInMap;
+std::map<NET_IFINDEX, uint64_t> g_prevNetOutMap;
+DWORD g_prevTimeMs = 0;
+
 void* g_gpuHandle = nullptr;
 bool g_hasGPU = false;
 bool g_showOverlay = true;
+bool g_keepAwake = false;
 
 bool g_isTiming = false;
 std::chrono::steady_clock::time_point g_startTime;
+
+double g_sumCpu = 0.0;
+unsigned int g_sumGpuTemp = 0;
+double g_peakCpu = 0.0;
+unsigned int g_peakGpuTemp = 0;
+int g_sampleCount = 0;
 
 int g_alertCount = 0;
 int g_cooldown = 0;
@@ -46,21 +63,36 @@ typedef int (*nvmlDeviceGetUtilizationRates_t)(void* device, nvmlUtilization_t* 
 nvmlDeviceGetTemperature_t nvmlGetTemp = nullptr;
 nvmlDeviceGetUtilizationRates_t nvmlGetUtil = nullptr;
 
-// ==========================================
-// 数据采集与审计逻辑
-// ==========================================
-std::string FormatSpeed(uint64_t bytes) {
+std::string FormatSpeed(uint64_t bytesPerSec) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2);
-    if (bytes >= 1024 * 1024) oss << (bytes / 1048576.0) << " MB/s";
-    else oss << (bytes / 1024.0) << " KB/s";
+    if (bytesPerSec >= 1048576) {
+        oss << (bytesPerSec / 1048576.0) << " MB/s";
+    } else {
+        oss << (bytesPerSec / 1024.0) << " KB/s";
+    }
     return oss.str();
 }
 
 uint64_t FT2U64(const FILETIME& ft) {
     ULARGE_INTEGER uli;
-    uli.LowPart = ft.dwLowDateTime; uli.HighPart = ft.dwHighDateTime;
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
     return uli.QuadPart;
+}
+
+std::string FormatDuration(int64_t totalSeconds) {
+    int64_t days = totalSeconds / 86400;
+    int64_t hours = (totalSeconds % 86400) / 3600;
+    int64_t minutes = (totalSeconds % 3600) / 60;
+    int64_t seconds = totalSeconds % 60;
+
+    std::ostringstream oss;
+    if (days > 0) oss << days << "d ";
+    if (hours > 0 || days > 0) oss << hours << "h ";
+    if (minutes > 0 || hours > 0 || days > 0) oss << minutes << "m ";
+    oss << seconds << "s";
+    return oss.str();
 }
 
 void InitHardware() {
@@ -75,6 +107,7 @@ void InitHardware() {
         }
     }
     GetSystemTimes(&g_prevIdleTime, &g_prevKernelTime, &g_prevUserTime);
+    g_prevTimeMs = GetTickCount(); // 初始化时间戳
 }
 
 void LogAnomaly() {
@@ -128,30 +161,68 @@ void UpdateHardwareData() {
         g_hwData.vramUtil = util.memory;
     }
 
-    uint64_t inBytes = 0, outBytes = 0;
-    DWORD dwSize = 0;
-    if (GetIfTable(NULL, &dwSize, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
-        std::vector<BYTE> buf(dwSize);
-        MIB_IFTABLE* table = reinterpret_cast<MIB_IFTABLE*>(buf.data());
-        if (GetIfTable(table, &dwSize, FALSE) == NO_ERROR) {
-            for (DWORD i = 0; i < table->dwNumEntries; i++) {
-                if (table->table[i].dwType != MIB_IF_TYPE_LOOPBACK) {
-                    inBytes += table->table[i].dwInOctets;
-                    outBytes += table->table[i].dwOutOctets;
+    // 计算实际逝去的时间（毫秒），平滑掉 UI 卡顿带来的网速波动
+    DWORD currentTimeMs = GetTickCount();
+    DWORD timeDeltaMs = currentTimeMs - g_prevTimeMs;
+    if (timeDeltaMs == 0) timeDeltaMs = 1;
+
+    uint64_t maxInDeltaBytes = 0;
+    uint64_t maxOutDeltaBytes = 0;
+    uint64_t maxTotalDelta = 0;
+
+    PMIB_IF_TABLE2 table = NULL;
+    if (GetIfTable2(&table) == NO_ERROR) {
+        for (ULONG i = 0; i < table->NumEntries; i++) {
+            if (table->Table[i].OperStatus == IfOperStatusUp &&
+               (table->Table[i].Type == IF_TYPE_ETHERNET_CSMACD || table->Table[i].Type == IF_TYPE_IEEE80211)) {
+
+                NET_IFINDEX idx = table->Table[i].InterfaceIndex;
+                uint64_t currentIn = table->Table[i].InOctets;
+                uint64_t currentOut = table->Table[i].OutOctets;
+
+
+                uint64_t deltaIn = 0, deltaOut = 0;
+
+                // 独立计算当前网卡的增量
+                if (g_prevNetInMap.count(idx)) {
+                    if (currentIn >= g_prevNetInMap[idx]) deltaIn = currentIn - g_prevNetInMap[idx];
+                    if (currentOut >= g_prevNetOutMap[idx]) deltaOut = currentOut - g_prevNetOutMap[idx];
+                }
+
+                g_prevNetInMap[idx] = currentIn;
+                g_prevNetOutMap[idx] = currentOut;
+
+                // 找出活动量最大的网卡作为主力网速显示
+                uint64_t totalDelta = deltaIn + deltaOut;
+                if (totalDelta > maxTotalDelta) {
+                    maxTotalDelta = totalDelta;
+                    maxInDeltaBytes = deltaIn;
+                    maxOutDeltaBytes = deltaOut;
                 }
             }
         }
+        FreeMibTable(table);
     }
-    g_hwData.dlSpeed = FormatSpeed(inBytes >= g_prevNetIn ? inBytes - g_prevNetIn : 0);
-    g_hwData.ulSpeed = FormatSpeed(outBytes >= g_prevNetOut ? outBytes - g_prevNetOut : 0);
-    g_prevNetIn = inBytes; g_prevNetOut = outBytes;
+
+    // 将特定时间段的增量，转化为标准的每秒速率 (Bytes/s)
+    g_hwData.dlSpeed = FormatSpeed((maxInDeltaBytes * 1000) / timeDeltaMs);
+    g_hwData.ulSpeed = FormatSpeed((maxOutDeltaBytes * 1000) / timeDeltaMs);
+    g_prevTimeMs = currentTimeMs;
 
     CheckAuditRules();
+
+    if (g_isTiming) {
+        g_sumCpu += g_hwData.cpuUsage;
+        if (g_hwData.cpuUsage > g_peakCpu) g_peakCpu = g_hwData.cpuUsage;
+
+        if (g_hasGPU) {
+            g_sumGpuTemp += g_hwData.gpuTemp;
+            if (g_hwData.gpuTemp > g_peakGpuTemp) g_peakGpuTemp = g_hwData.gpuTemp;
+        }
+        g_sampleCount++;
+    }
 }
 
-// ==========================================
-// 界面渲染与托盘控制
-// ==========================================
 void DrawOverlay(HDC hdc) {
     std::ostringstream text;
     text << std::fixed << std::setprecision(1);
@@ -187,7 +258,7 @@ void InitTrayIcon(HWND hwnd) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    g_nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_APP_ICON));
     lstrcpyA(g_nid.szTip, "WinSentry");
     Shell_NotifyIconA(NIM_ADD, &g_nid);
 }
@@ -198,7 +269,8 @@ void ShowTrayMenu(HWND hwnd) {
     HMENU hMenu = CreatePopupMenu();
 
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_TOGGLE, g_showOverlay ? L"隐藏悬浮窗" : L"显示悬浮窗");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_TIMER, g_isTiming ? L"停止计时" : L"开始游戏计时");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_TIMER, g_isTiming ? L"停止游戏计时" : L"开始游戏计时");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_AWAKE, g_keepAwake ? L"取消屏幕常亮" : L"保持屏幕常亮");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出程序");
 
@@ -221,30 +293,55 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             else if (LOWORD(wParam) == ID_TRAY_TIMER) {
                 if (!g_isTiming) {
-                    // 开始计时：记录时间，并把窗口高度动态拉伸到 115
+                    g_sumCpu = 0.0;
+                    g_sumGpuTemp = 0;
+                    g_peakCpu = 0.0;
+                    g_peakGpuTemp = 0;
+                    g_sampleCount = 0;
+
                     g_startTime = std::chrono::steady_clock::now();
                     g_isTiming = true;
                     SetWindowPos(hwnd, NULL, 0, 0, 220, 115, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                 } else {
-                    // 停止计时：还原标志位，并把窗口高度缩回 90
                     g_isTiming = false;
                     SetWindowPos(hwnd, NULL, 0, 0, 220, 90, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
                     auto now = std::chrono::steady_clock::now();
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_startTime).count();
 
-                    if (elapsed >= 60) {
+                    if (elapsed >= 60 && g_sampleCount > 0) {
                         SYSTEMTIME st;
                         GetLocalTime(&st);
                         char timeStr[64];
                         sprintf_s(timeStr, "%04d-%02d-%02d %02d:%02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
+                        double avgCpu = g_sumCpu / g_sampleCount;
+                        double avgGpuTemp = g_hasGPU ? (double)g_sumGpuTemp / g_sampleCount : 0.0;
+
                         std::ofstream file("WinSentry_GameTime.csv", std::ios::app);
                         if (file.is_open()) {
-                            file << timeStr << ", SessionDuration(s): " << elapsed << "\n";
+                            file.seekp(0, std::ios::end);
+                            if (file.tellp() == 0) {
+                                file << "EndTime,Duration,AvgCPU(%),PeakCPU(%),AvgGPUTemp(C),PeakGPUTemp(C)\n";
+                            }
+                            file << timeStr << ","
+                                 << FormatDuration(elapsed) << ","
+                                 << std::fixed << std::setprecision(1) << avgCpu << ","
+                                 << g_peakCpu << ",";
+
+                            if (g_hasGPU) file << avgGpuTemp << "," << g_peakGpuTemp << "\n";
+                            else file << "N/A,N/A\n";
                         }
                     }
                     InvalidateRect(hwnd, NULL, TRUE);
+                }
+            }
+            else if (LOWORD(wParam) == ID_TRAY_AWAKE) {
+                g_keepAwake = !g_keepAwake;
+                if (g_keepAwake) {
+                    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+                } else {
+                    SetThreadExecutionState(ES_CONTINUOUS);
                 }
             }
             else if (LOWORD(wParam) == ID_TRAY_EXIT) {
@@ -265,6 +362,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_DESTROY:
             Shell_NotifyIconA(NIM_DELETE, &g_nid);
+            SetThreadExecutionState(ES_CONTINUOUS);
             PostQuitMessage(0);
             return 0;
     }
@@ -276,13 +374,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     const char* className = "WinSentryOverlay";
     WNDCLASSA wc = { 0 };
+    wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = className;
     RegisterClassA(&wc);
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
-    // 初始创建时，默认高度为不计时的 90
     HWND hwnd = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         className, "WinSentry", WS_POPUP,
